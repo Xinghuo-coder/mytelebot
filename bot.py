@@ -1057,6 +1057,13 @@ async def main():
         name='早上7:00财经日历',
         replace_existing=True
     )
+    scheduler.add_job(
+        send_financial_calendar,
+        CronTrigger(hour=21, minute=0),
+        id='calendar_2100',
+        name='晚上21:00财经日历',
+        replace_existing=True
+    )
     
     # 启动调度器
     scheduler.start()
