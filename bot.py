@@ -705,6 +705,144 @@ async def generate_news_brief():
         logger.error(f"生成财经简报时发生错误: {e}")
 
 
+async def get_financial_calendar():
+    """获取今日财经日历"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            # 使用金十数据API获取财经日历
+            url = "https://rili.jin10.com/data/daily_events"
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+                'Referer': 'https://rili.jin10.com/',
+            }
+            
+            async with session.get(url, headers=headers, timeout=15) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    # 提取重要事件（importance >= 2）
+                    events = []
+                    if isinstance(data, list):
+                        for item in data:
+                            importance = item.get('star', 0)
+                            if importance >= 2:  # 只获取重要事件
+                                time = item.get('pub_time', '')
+                                country = item.get('country', '')
+                                event_name = item.get('name', '')
+                                unit = item.get('unit', '')
+                                previous = item.get('previous', '')
+                                forecast = item.get('consensus', '')
+                                
+                                # 格式化事件信息
+                                event_info = f"{time} {country} {event_name}"
+                                if forecast:
+                                    event_info += f" (预期: {forecast}{unit})"
+                                if previous:
+                                    event_info += f" (前值: {previous}{unit})"
+                                
+                                events.append({
+                                    'time': time,
+                                    'info': event_info,
+                                    'importance': importance
+                                })
+                    
+                    if events:
+                        # 按时间排序
+                        events.sort(key=lambda x: x['time'])
+                        logger.info(f"获取到 {len(events)} 条财经日历事件")
+                        return events
+                    
+            # 备用方案：从英为财情获取
+            url2 = "https://cn.investing.com/economic-calendar/"
+            headers2 = {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+                'Accept-Language': 'zh-CN,zh;q=0.9',
+            }
+            
+            async with session.get(url2, headers=headers2, timeout=15) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    import re
+                    from bs4 import BeautifulSoup
+                    
+                    soup = BeautifulSoup(html, 'html.parser')
+                    events = []
+                    
+                    # 查找今日事件行
+                    rows = soup.find_all('tr', {'class': re.compile(r'event')})
+                    for row in rows[:15]:  # 限制数量
+                        try:
+                            time_elem = row.find('td', {'class': 'time'})
+                            event_elem = row.find('td', {'class': 'event'})
+                            importance_elem = row.find('td', {'class': 'sentiment'})
+                            
+                            if time_elem and event_elem:
+                                time = time_elem.get_text(strip=True)
+                                event_name = event_elem.get_text(strip=True)
+                                
+                                # 判断重要性（通过bull图标数量）
+                                bulls = importance_elem.find_all('i', {'class': 'grayFullBullishIcon'}) if importance_elem else []
+                                importance = len(bulls)
+                                
+                                if importance >= 2:  # 只获取重要事件
+                                    events.append({
+                                        'time': time,
+                                        'info': f"{time} {event_name}",
+                                        'importance': importance
+                                    })
+                        except Exception as e:
+                            continue
+                    
+                    if events:
+                        logger.info(f"从备用源获取到 {len(events)} 条财经日历事件")
+                        return events
+            
+            logger.warning("未能获取到财经日历数据")
+            return []
+            
+    except Exception as e:
+        logger.error(f"获取财经日历失败: {e}")
+        return []
+
+
+async def send_financial_calendar():
+    """发送今日财经日历"""
+    try:
+        events = await get_financial_calendar()
+        
+        if not events:
+            logger.warning("未获取到财经日历数据，跳过推送")
+            return
+        
+        # 构建消息
+        current_date = datetime.now().strftime('%Y年%m月%d日')
+        message = f"📅 <b>{current_date} 财经日历</b>\n\n"
+        message += "<b>今日重要事件：</b>\n\n"
+        
+        for event in events[:12]:  # 限制显示数量
+            importance = event['importance']
+            stars = '⭐' * importance
+            message += f"{stars} {event['info']}\n"
+        
+        if len(events) > 12:
+            message += f"\n... 还有 {len(events) - 12} 个其他事件"
+        
+        message += "\n\n💡 <i>请关注重要数据发布时间</i>"
+        
+        # 发送消息
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text=message,
+            parse_mode='HTML'
+        )
+        logger.info(f"财经日历发送成功: {current_date}")
+        
+    except TelegramError as e:
+        logger.error(f"发送财经日历失败: {e}")
+    except Exception as e:
+        logger.error(f"生成财经日历时发生错误: {e}")
+
+
 async def ask_ai(question: str) -> str:
     """使用Google Gemini回答问题"""
     if not config.AI_ENABLED:
@@ -887,26 +1025,35 @@ async def main():
         replace_existing=True
     )
     
-    # 添加财经新闻简报定时任务
+    # 添加财经新闻简报定时任务（已暂停）
+    # scheduler.add_job(
+    #     generate_news_brief,
+    #     CronTrigger(hour=9, minute=0),
+    #     id='news_brief_0900',
+    #     name='上午9:00财经简报',
+    #     replace_existing=True
+    # )
+    # scheduler.add_job(
+    #     generate_news_brief,
+    #     CronTrigger(hour=17, minute=0),
+    #     id='news_brief_1700',
+    #     name='下午17:00财经简报',
+    #     replace_existing=True
+    # )
+    # scheduler.add_job(
+    #     generate_news_brief,
+    #     CronTrigger(hour=23, minute=0),
+    #     id='news_brief_2300',
+    #     name='晚上23:00财经简报',
+    #     replace_existing=True
+    # )
+    
+    # 添加财经日历定时任务
     scheduler.add_job(
-        generate_news_brief,
-        CronTrigger(hour=9, minute=0),
-        id='news_brief_0900',
-        name='上午9:00财经简报',
-        replace_existing=True
-    )
-    scheduler.add_job(
-        generate_news_brief,
-        CronTrigger(hour=17, minute=0),
-        id='news_brief_1700',
-        name='下午17:00财经简报',
-        replace_existing=True
-    )
-    scheduler.add_job(
-        generate_news_brief,
-        CronTrigger(hour=23, minute=0),
-        id='news_brief_2300',
-        name='晚上23:00财经简报',
+        send_financial_calendar,
+        CronTrigger(hour=7, minute=0),
+        id='calendar_0700',
+        name='早上7:00财经日历',
         replace_existing=True
     )
     
