@@ -15,6 +15,18 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import google.generativeai as genai
 import config
+import json
+import os
+
+# Twitter API (tweepy)
+try:
+    import tweepy
+    TWEEPY_AVAILABLE = True
+except ImportError:
+    TWEEPY_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+    if config.TRUMP_TWITTER_ENABLED and config.TWITTER_USE_OFFICIAL_API:
+        logger.warning("tweepy未安装，请运行: pip install tweepy")
 
 # 配置日志
 logging.basicConfig(
@@ -34,6 +46,32 @@ bot = Bot(token=BOT_TOKEN)
 if config.AI_ENABLED:
     genai.configure(api_key=config.GEMINI_API_KEY)
     gemini_model = genai.GenerativeModel(config.GEMINI_MODEL)
+
+# 川普推特监控 - 存储已发送的推文ID
+SENT_TWEETS_FILE = "sent_tweets.json"
+sent_tweet_ids = set()
+
+def load_sent_tweets():
+    """从文件加载已发送的推文ID"""
+    global sent_tweet_ids
+    try:
+        if os.path.exists(SENT_TWEETS_FILE):
+            with open(SENT_TWEETS_FILE, 'r') as f:
+                sent_tweet_ids = set(json.load(f))
+                logger.info(f"已加载 {len(sent_tweet_ids)} 个已发送推文ID")
+    except Exception as e:
+        logger.error(f"加载已发送推文ID失败: {e}")
+        sent_tweet_ids = set()
+
+def save_sent_tweets():
+    """保存已发送的推文ID到文件"""
+    try:
+        # 只保留最近100个ID，避免文件过大
+        tweets_to_save = list(sent_tweet_ids)[-100:]
+        with open(SENT_TWEETS_FILE, 'w') as f:
+            json.dump(tweets_to_save, f)
+    except Exception as e:
+        logger.error(f"保存已发送推文ID失败: {e}")
 
 
 async def get_gold_price():
@@ -300,6 +338,290 @@ async def get_eth_price():
     except Exception as e:
         logger.error(f"获取ETH价格失败: {e}")
         return "💎 ETH: --"
+
+
+async def get_trump_tweets():
+    """获取指定用户的最新推文"""
+    if not config.TRUMP_TWITTER_ENABLED:
+        return []
+    
+    tweets = []
+    
+    # 优先使用官方API
+    if config.TWITTER_USE_OFFICIAL_API and TWEEPY_AVAILABLE:
+        try:
+            # 使用Twitter API V2 (免费层级可用)
+            client = tweepy.Client(
+                consumer_key=config.TWITTER_API_KEY,
+                consumer_secret=config.TWITTER_API_SECRET,
+                access_token=config.TWITTER_ACCESS_TOKEN,
+                access_token_secret=config.TWITTER_ACCESS_TOKEN_SECRET
+            )
+            
+            # 获取用户ID
+            user = client.get_user(username=config.TRUMP_TWITTER_USERNAME)
+            if not user.data:
+                logger.error(f"用户 @{config.TRUMP_TWITTER_USERNAME} 不存在")
+                return []
+            
+            user_id = user.data.id
+            
+            # 获取用户最新推文 (使用API V2)
+            tweets_response = client.get_users_tweets(
+                id=user_id,
+                max_results=5,
+                exclude=['retweets', 'replies'],
+                tweet_fields=['created_at', 'text']
+            )
+            
+            if tweets_response.data:
+                for tweet in tweets_response.data:
+                    tweets.append({
+                        'id': str(tweet.id),
+                        'content': tweet.text,
+                        'time': tweet.created_at.strftime('%Y-%m-%d %H:%M:%S') if tweet.created_at else '',
+                        'url': f"https://twitter.com/{config.TRUMP_TWITTER_USERNAME}/status/{tweet.id}"
+                    })
+                
+                logger.info(f"从Twitter API V2获取到 {len(tweets)} 条推文")
+                return tweets
+            else:
+                logger.warning(f"用户 @{config.TRUMP_TWITTER_USERNAME} 暂无推文")
+                return []
+                
+        except Exception as e:
+            logger.error(f"Twitter官方API获取失败: {e}")
+            logger.info("尝试使用备用方案...")
+    
+    # 备用方案：使用第三方服务
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            # 方法1: 尝试使用 Nitter (Twitter的开源前端)
+            for nitter_instance in config.TRUMP_NITTER_INSTANCES:
+                try:
+                    url = f"{nitter_instance}/{config.TRUMP_TWITTER_USERNAME}"
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+                    }
+                    
+                    async with session.get(url, headers=headers, timeout=10) as response:
+                        if response.status == 200:
+                            html = await response.text()
+                            import re
+                            from html import unescape
+                            
+                            # 解析推文内容
+                            # Nitter的HTML结构：推文在 <div class="tweet-content"> 中
+                            tweet_pattern = r'<div class="tweet-content[^"]*"[^>]*>(.*?)</div>'
+                            tweet_matches = re.findall(tweet_pattern, html, re.DOTALL)
+                            
+                            # 解析推文ID和时间
+                            tweet_link_pattern = r'href="/[^/]+/status/(\d+)"'
+                            tweet_ids = re.findall(tweet_link_pattern, html)
+                            
+                            # 解析时间
+                            time_pattern = r'<span class="tweet-date"[^>]*title="([^"]+)"'
+                            times = re.findall(time_pattern, html)
+                            
+                            for i, (content, tweet_id) in enumerate(zip(tweet_matches[:5], tweet_ids[:5])):
+                                # 清理HTML标签
+                                clean_content = re.sub(r'<[^>]+>', '', content)
+                                clean_content = unescape(clean_content).strip()
+                                
+                                # 跳过转发和回复
+                                if clean_content.startswith('RT @') or clean_content.startswith('@'):
+                                    continue
+                                
+                                tweet_time = times[i] if i < len(times) else "未知时间"
+                                
+                                tweets.append({
+                                    'id': tweet_id,
+                                    'content': clean_content,
+                                    'time': tweet_time,
+                                    'url': f"https://twitter.com/{config.TRUMP_TWITTER_USERNAME}/status/{tweet_id}"
+                                })
+                            
+                            if tweets:
+                                logger.info(f"从 {nitter_instance} 获取到 {len(tweets)} 条推文")
+                                return tweets
+                            
+                except Exception as e:
+                    logger.warning(f"从 {nitter_instance} 获取推文失败: {e}")
+                    continue
+            
+            # 方法2: 使用 Twitter API (需要API密钥)
+            # 这里可以添加Twitter API的实现，但需要用户自己申请API密钥
+            
+            # 方法3: 使用 RSS Bridge (更可靠的备选方案)
+            try:
+                # 尝试使用 RSS Bridge
+                rss_instances = [
+                    f"https://rss-bridge.org/bridge01/?action=display&bridge=Twitter&context=By+username&u={config.TRUMP_TWITTER_USERNAME}&format=Json",
+                    f"https://wtf.roflcopter.fr/rss-bridge/?action=display&bridge=Twitter&context=By+username&u={config.TRUMP_TWITTER_USERNAME}&format=Json",
+                ]
+                
+                for rss_url in rss_instances:
+                    try:
+                        headers = {
+                            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+                        }
+                        
+                        async with session.get(rss_url, headers=headers, timeout=10) as response:
+                            if response.status == 200:
+                                try:
+                                    data = await response.json()
+                                    
+                                    if 'items' in data:
+                                        for item in data['items'][:5]:
+                                            # 从URL提取推文ID
+                                            url = item.get('url', '')
+                                            tweet_id = url.split('/')[-1] if url else ''
+                                            content = item.get('content_text', '') or item.get('title', '')
+                                            date = item.get('date_published', '')
+                                            
+                                            # 跳过转发
+                                            if content.startswith('RT @'):
+                                                continue
+                                            
+                                            tweets.append({
+                                                'id': tweet_id,
+                                                'content': content,
+                                                'time': date,
+                                                'url': url
+                                            })
+                                        
+                                        if tweets:
+                                            logger.info(f"从 RSS Bridge 获取到 {len(tweets)} 条推文")
+                                            return tweets
+                                except Exception as e:
+                                    logger.warning(f"解析RSS数据失败: {e}")
+                                    continue
+                    except Exception as e:
+                        logger.warning(f"从 {rss_url} 获取失败: {e}")
+                        continue
+                        
+            except Exception as e:
+                logger.warning(f"RSS Bridge 方法失败: {e}")
+            
+            # 方法4: 使用 Syndication API (作为最后备选)
+            try:
+                api_url = f"https://cdn.syndication.twimg.com/timeline/profile?screen_name={config.TRUMP_TWITTER_USERNAME}&count=5"
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+                    'Accept': 'application/json'
+                }
+                
+                async with session.get(api_url, headers=headers, timeout=10) as response:
+                    if response.status == 200:
+                        content_type = response.headers.get('content-type', '')
+                        
+                        # 尝试解析JSON
+                        if 'json' in content_type.lower():
+                            data = await response.json()
+                        else:
+                            # 尝试强制解析为JSON
+                            text = await response.text()
+                            import json
+                            data = json.loads(text)
+                        
+                        if 'timeline' in data:
+                            for tweet_data in data['timeline'][:5]:
+                                tweet_id = tweet_data.get('id_str', '')
+                                content = tweet_data.get('text', '')
+                                created_at = tweet_data.get('created_at', '')
+                                
+                                if content.startswith('RT @'):
+                                    continue
+                                
+                                tweets.append({
+                                    'id': tweet_id,
+                                    'content': content,
+                                    'time': created_at,
+                                    'url': f"https://twitter.com/{config.TRUMP_TWITTER_USERNAME}/status/{tweet_id}"
+                                })
+                            
+                            if tweets:
+                                logger.info(f"从 Syndication API 获取到 {len(tweets)} 条推文")
+                                return tweets
+                                
+            except Exception as e:
+                logger.warning(f"从 Syndication API 获取推文失败: {e}")
+            
+            # 如果所有方法都失败
+            logger.warning("所有获取推文的方法都失败了")
+            return []
+            
+    except Exception as e:
+        logger.error(f"获取川普推文失败: {e}")
+        return []
+
+
+async def check_and_send_trump_tweets():
+    """检查并发送川普的新推文"""
+    if not config.TRUMP_TWITTER_ENABLED:
+        return
+    
+    try:
+        logger.info("开始检查川普推特...")
+        tweets = await get_trump_tweets()
+        
+        if not tweets:
+            logger.info("未获取到新推文")
+            return
+        
+        new_tweets_sent = 0
+        
+        # 倒序处理推文，先发旧的
+        for tweet in reversed(tweets):
+            tweet_id = tweet['id']
+            
+            # 检查是否已发送
+            if tweet_id in sent_tweet_ids:
+                continue
+            
+            # 构建消息
+            username_display = config.TRUMP_TWITTER_USERNAME
+            message = f"""
+🐦 <b>@{username_display} 推特更新</b>
+
+{tweet['content']}
+
+🔗 <a href="{tweet['url']}">查看原推文</a>
+🕐 {tweet['time']}
+            """.strip()
+            
+            try:
+                # 发送消息
+                await bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=message,
+                    parse_mode='HTML',
+                    disable_web_page_preview=False
+                )
+                
+                # 记录已发送
+                sent_tweet_ids.add(tweet_id)
+                save_sent_tweets()
+                new_tweets_sent += 1
+                
+                logger.info(f"✅ 成功发送推文 @{config.TRUMP_TWITTER_USERNAME} ID: {tweet_id}")
+                
+                # 避免发送太快
+                await asyncio.sleep(2)
+                
+            except TelegramError as e:
+                logger.error(f"发送川普推文失败: {e}")
+                # 即使发送失败，也标记为已处理，避免重复尝试
+                sent_tweet_ids.add(tweet_id)
+                save_sent_tweets()
+        
+        if new_tweets_sent > 0:
+            logger.info(f"✅ 共发送了 {new_tweets_sent} 条新推文")
+        else:
+            logger.info("没有新推文需要发送")
+            
+    except Exception as e:
+        logger.error(f"检查川普推文时发生错误: {e}")
 
 
 async def get_sse_index():
@@ -935,33 +1257,44 @@ async def handle_message(update: Update, context):
 
 async def start_command(update: Update, context):
     """处理/start命令"""
+    trump_status = "✅ 已启用" if config.TRUMP_TWITTER_ENABLED else "❌ 未启用"
     await update.message.reply_text(
         "你好！我是金融价格机器人 + AI助手 🤖\n\n"
         "功能：\n"
         "1. 定时推送金融市场价格信息\n"
-        "2. 在群里@我或回复我的消息来提问，我会用AI回答你的问题\n\n"
+        "2. 实时监控川普推特并推送 " + trump_status + "\n"
+        "3. 在群里@我或回复我的消息来提问，我会用AI回答你的问题\n\n"
         "示例：@bot 今天天气怎么样？"
     )
 
 
 async def help_command(update: Update, context):
     """处理/help命令"""
+    trump_info = ""
+    if config.TRUMP_TWITTER_ENABLED:
+        trump_info = f"\n\n🐦 <b>川普推特监控</b>\n每{config.TRUMP_CHECK_INTERVAL}分钟自动检查川普推特\n发现新推文将立即推送到群里"
+    
     await update.message.reply_text(
-        "📖 使用说明：\n\n"
-        "💰 自动推送价格信息\n"
-        "机器人会在每天固定时间自动推送金融市场价格\n\n"
-        "🤖 AI问答功能\n"
+        "📖 <b>使用说明：</b>\n\n"
+        "💰 <b>自动推送价格信息</b>\n"
+        "机器人会在每天固定时间自动推送金融市场价格"
+        + trump_info +
+        "\n\n🤖 <b>AI问答功能</b>\n"
         "- 在群里@机器人 + 问题\n"
         "- 或者回复机器人的消息来提问\n\n"
-        "示例：\n"
+        "<b>示例：</b>\n"
         "@bot 比特币是什么？\n"
-        "@bot 如何理财？"
+        "@bot 如何理财？",
+        parse_mode='HTML'
     )
 
 
 async def main():
     """主函数"""
     logger.info("机器人启动中...")
+    
+    # 加载已发送的推文ID
+    load_sent_tweets()
     
     # 创建Application实例（用于接收消息）
     application = Application.builder().token(BOT_TOKEN).build()
@@ -1065,12 +1398,29 @@ async def main():
         replace_existing=True
     )
     
+    # 添加川普推特监控定时任务
+    if config.TRUMP_TWITTER_ENABLED:
+        from apscheduler.triggers.interval import IntervalTrigger
+        scheduler.add_job(
+            check_and_send_trump_tweets,
+            IntervalTrigger(minutes=config.TRUMP_CHECK_INTERVAL),
+            id='trump_twitter_check',
+            name=f'每{config.TRUMP_CHECK_INTERVAL}分钟检查川普推特',
+            replace_existing=True
+        )
+        logger.info(f"川普推特监控已启用，每{config.TRUMP_CHECK_INTERVAL}分钟检查一次")
+    
     # 启动调度器
     scheduler.start()
     logger.info("调度器已启动")
     
     # 立即发送一次测试消息
     await send_price_update()
+    
+    # 立即检查一次川普推特（如果启用）
+    if config.TRUMP_TWITTER_ENABLED:
+        logger.info("立即检查川普推特...")
+        await check_and_send_trump_tweets()
     
     # 启动bot接收消息
     logger.info("启动消息接收...")
