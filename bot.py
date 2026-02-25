@@ -625,36 +625,58 @@ async def check_and_send_trump_tweets():
 
 
 async def get_sse_index():
-    """获取沪A大盘指数（上证指数）"""
+    """获取沪A大盘指数（上证指数）- 使用东方财富网API"""
     try:
         async with aiohttp.ClientSession() as session:
-            # 使用Yahoo Finance获取上证指数 (代码: 000001.SS)
-            url = "https://query1.finance.yahoo.com/v8/finance/chart/000001.SS"
+            # 使用东方财富网API获取上证指数
+            url = "https://push2.eastmoney.com/api/qt/stock/get"
+            params = {
+                'secid': '1.000001',  # 上证指数
+                'fields': 'f43,f44,f45,f46,f57,f58,f60,f170',
+                'ut': 'fa5fd1943c7b386f172d6893dbfba10b'
+            }
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+                'Referer': 'https://quote.eastmoney.com/'
             }
             
-            async with session.get(url, headers=headers, timeout=15) as response:
+            async with session.get(url, params=params, headers=headers, timeout=15) as response:
                 if response.status == 200:
                     data = await response.json()
-                    if data.get('chart') and data['chart'].get('result'):
-                        result = data['chart']['result'][0]
-                        meta = result.get('meta', {})
-                        price = meta.get('regularMarketPrice')
-                        prev_close = meta.get('chartPreviousClose')
+                    
+                    if data.get('data'):
+                        quote = data['data']
                         
-                        if price and prev_close:
-                            change_pct = ((price - prev_close) / prev_close) * 100
+                        # 东方财富网价格字段说明:
+                        # f43: 最新价 (单位: 分，需要除以100)
+                        # f60: 昨收价 (单位: 分，需要除以100)
+                        # f170: 涨跌幅百分比 (单位: 百分点的100倍，需要除以100)
+                        price = quote.get('f43', 0)  # 最新价
+                        prev_close = quote.get('f60', 0)  # 昨收
+                        change_pct = quote.get('f170', 0)  # 涨跌幅
+                        
+                        if price > 0 and prev_close > 0:
+                            # 价格需要除以100转换为点数
+                            price = price / 100
+                            prev_close = prev_close / 100
+                            # 涨跌幅需要除以100转换为百分比
+                            change_pct = change_pct / 100
                             change_value = price - prev_close
                             
                             # 检查市场状态
-                            market_state = meta.get('marketState', 'CLOSED')
                             current_weekday = datetime.now().weekday()
+                            current_hour = datetime.now().hour
                             
                             market_status = ""
+                            # 交易日：周一至周五
+                            # 交易时间：9:30-11:30, 13:00-15:00
                             if current_weekday >= 5:  # 周末
                                 market_status = " [周五收盘]"
-                            elif market_state == 'CLOSED':
+                            elif current_hour < 9 or (current_hour == 9 and datetime.now().minute < 30):
+                                market_status = " [未开盘]"
+                            elif (current_hour >= 11 and current_hour < 13) or (current_hour == 11 and datetime.now().minute >= 30):
+                                market_status = " [午间休市]"
+                            elif current_hour >= 15:
                                 market_status = " [收盘]"
                             
                             change_symbol = "📈" if change_pct >= 0 else "📉"
