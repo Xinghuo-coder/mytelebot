@@ -1377,57 +1377,19 @@ async def main():
     # 创建调度器
     scheduler = AsyncIOScheduler()
     
-    # 添加定时任务 - 每天指定时间执行
-    # 时间：07:30, 11:30, 15:00, 17:40, 20:00, 21:00, 22:00
-    scheduler.add_job(
-        send_price_update,
-        CronTrigger(hour=7, minute=30),
-        id='price_update_0730',
-        name='早上7:30价格更新',
-        replace_existing=True
-    )
-    scheduler.add_job(
-        send_price_update,
-        CronTrigger(hour=11, minute=30),
-        id='price_update_1130',
-        name='上午11:30价格更新',
-        replace_existing=True
-    )
-    scheduler.add_job(
-        send_price_update,
-        CronTrigger(hour=15, minute=0),
-        id='price_update_1500',
-        name='下午15:00价格更新',
-        replace_existing=True
-    )
-    scheduler.add_job(
-        send_price_update,
-        CronTrigger(hour=17, minute=40),
-        id='price_update_1740',
-        name='下午17:40价格更新',
-        replace_existing=True
-    )
-    scheduler.add_job(
-        send_price_update,
-        CronTrigger(hour=20, minute=0),
-        id='price_update_2000',
-        name='晚上20:00价格更新',
-        replace_existing=True
-    )
-    scheduler.add_job(
-        send_price_update,
-        CronTrigger(hour=21, minute=0),
-        id='price_update_2100',
-        name='晚上21:00价格更新',
-        replace_existing=True
-    )
-    scheduler.add_job(
-        send_price_update,
-        CronTrigger(hour=22, minute=0),
-        id='price_update_2200',
-        name='晚上22:00价格更新',
-        replace_existing=True
-    )
+    # 添加定时任务 - 根据config.py配置动态添加
+    # 从配置文件读取定时任务时间
+    for hour in config.SCHEDULE_HOURS:
+        minute = config.SCHEDULE_MINUTES.get(hour, 0)  # 如果没有特殊分钟数，默认为整点
+        time_str = f"{hour:02d}:{minute:02d}"
+        scheduler.add_job(
+            send_price_update,
+            CronTrigger(hour=hour, minute=minute),
+            id=f'price_update_{hour:02d}{minute:02d}',
+            name=f'{time_str}价格更新',
+            replace_existing=True
+        )
+        logger.info(f"已添加定时任务: {time_str}价格更新")
     
     # 添加财经新闻简报定时任务（已暂停）
     # scheduler.add_job(
@@ -1452,21 +1414,19 @@ async def main():
     #     replace_existing=True
     # )
     
-    # 添加财经日历定时任务
-    scheduler.add_job(
-        send_financial_calendar,
-        CronTrigger(hour=7, minute=0),
-        id='calendar_0700',
-        name='早上7:00财经日历',
-        replace_existing=True
-    )
-    scheduler.add_job(
-        send_financial_calendar,
-        CronTrigger(hour=21, minute=0),
-        id='calendar_2100',
-        name='晚上21:00财经日历',
-        replace_existing=True
-    )
+    # 添加财经日历定时任务 - 从配置文件读取
+    for hour in config.CALENDAR_HOURS:
+        minute = config.CALENDAR_MINUTES.get(hour, 0)
+        time_str = f"{hour:02d}:{minute:02d}"
+        time_label = "早上" if hour < 12 else "下午" if hour < 18 else "晚上"
+        scheduler.add_job(
+            send_financial_calendar,
+            CronTrigger(hour=hour, minute=minute),
+            id=f'calendar_{hour:02d}{minute:02d}',
+            name=f'{time_label}{time_str}财经日历',
+            replace_existing=True
+        )
+        logger.info(f"已添加财经日历任务: {time_label}{time_str}")
     
     # 添加川普推特监控定时任务
     if config.TRUMP_TWITTER_ENABLED:
