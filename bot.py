@@ -830,11 +830,57 @@ async def get_hsi_index():
         return "📊 恒生指数: --"
 
 
+async def get_hstech_index():
+    """获取恒生科技指数"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            # 使用Yahoo Finance获取恒生科技指数 (代码: HSTECH.HK)
+            url = "https://query1.finance.yahoo.com/v8/finance/chart/HSTECH.HK"
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+            }
+            
+            async with session.get(url, headers=headers, timeout=15) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get('chart') and data['chart'].get('result'):
+                        result = data['chart']['result'][0]
+                        meta = result.get('meta', {})
+                        price = meta.get('regularMarketPrice')
+                        prev_close = meta.get('chartPreviousClose')
+                        
+                        if price and prev_close:
+                            change_pct = ((price - prev_close) / prev_close) * 100
+                            change_value = price - prev_close
+                            
+                            # 检查市场状态
+                            market_state = meta.get('marketState', 'CLOSED')
+                            current_weekday = datetime.now().weekday()
+                            
+                            market_status = ""
+                            if current_weekday >= 5:  # 周末
+                                market_status = " [周五收盘]"
+                            elif market_state == 'CLOSED':
+                                market_status = " [收盘]"
+                            
+                            change_symbol = "📈" if change_pct >= 0 else "📉"
+                            return f"🔬 恒生科技: {price:,.2f}{market_status} {change_symbol}{change_value:+.2f} ({change_pct:+.2f}%)"
+                        
+                logger.warning("恒生科技指数API返回数据格式异常")
+                return "🔬 恒生科技: --"
+    except asyncio.TimeoutError:
+        logger.error("获取恒生科技指数超时")
+        return "🔬 恒生科技: 超时"
+    except Exception as e:
+        logger.error(f"获取恒生科技指数失败: {e}")
+        return "🔬 恒生科技: --"
+
+
 async def send_price_update():
     """发送价格更新消息"""
     try:
         # 获取所有价格信息
-        gold, shanghai_gold, dollar, usdcny, oil, btc, eth, sse, nasdaq, dow, hsi = await asyncio.gather(
+        gold, shanghai_gold, dollar, usdcny, oil, btc, eth, sse, nasdaq, dow, hsi, hstech = await asyncio.gather(
             get_gold_price(),
             get_shanghai_gold_price(),
             get_dollar_index(),
@@ -845,7 +891,8 @@ async def send_price_update():
             get_sse_index(),
             get_nasdaq_index(),
             get_dow_jones_index(),
-            get_hsi_index()
+            get_hsi_index(),
+            get_hstech_index()
         )
         
         # 构建消息
@@ -864,6 +911,7 @@ async def send_price_update():
 {nasdaq}
 {dow}
 {hsi}
+{hstech}
 
 🕐 更新时间: {current_time}
         """.strip()
